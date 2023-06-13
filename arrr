@@ -292,7 +292,7 @@ fc_ <- file.copy(infnames, content_path, overwrite=TRUE, recursive=TRUE)
 
 # Generate top-level README.md file, with reference
 readme.fname <- "README.md"
-readme_content <- c(str_glue("# {opt$outdir}"), "", "", "Replication package generated with [R-arrr](https://github.com/bugcounting/rarrr).")
+readme_content <- c(str_glue("# {opt$outdir}"), "", "", "Replication package generated with [R-arrr](https://github.com/atom-sw/r-arr).")
 writeLines(readme_content, con=path.join(out_path, readme.fname))
 
 message(str_glue("Done! Find the replication package at {out_path}"))
