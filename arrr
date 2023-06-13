@@ -1,0 +1,298 @@
+#! /usr/bin/env Rscript
+
+## Import libraries
+suppressMessages( suppressWarnings({
+  library("this.path")
+  library("optparse")
+  library("renv")
+  library("devtools")
+  library("dplyr")
+  library("stringr")
+  library("forcats")
+}))
+
+
+## Fixed parameters
+dockerfile.fname <- "Dockerfile"
+bash_bootstrap.fname <- "bash-bootstrap.sh"
+r_bootstrap.fname <- "r-bootstrap.R"
+scripts_dir <- "scripts"
+
+
+## Process command line
+work_dir <- getwd()
+script_dir <- this.dir()
+script_name <- basename2(this.path())
+
+option_list = list(
+  make_option(c("--cran"), type="character", default="https://stat.ethz.ch/CRAN/",
+              help="CRAN repository URL (default: %default)", metavar="cran_url"),
+  make_option(c("--content"), type="character", default="data-analysis", 
+              help="content subdirectory name (default: %default)", metavar="content"),
+  make_option(c("--outdir"), type="character", default="replication-package", 
+              help="output directory name (default: %default)", metavar="outdir"),
+  make_option(c("--overwrite"), action="store_true", default=FALSE, 
+              help="if output directory exists, overwrite it", metavar="overwrite")
+)
+
+parser <- OptionParser(usage = "%prog [options] file_or_dir1 [file_or_dir2 [file_or_dir3 [...]]]", 
+                       option_list=option_list,
+                       description=str_glue("\n
+                       Given a list of files and directories (containing data and analysis scripts), 
+                       look for R and Rmd files among them and determine the R packages they use. 
+                       Then, generate Bash and R bootstrap scripts to install an R environment complete 
+                       with all these packages. These bootstrap scripts should work on any Linux system 
+                       with Anaconda installed. Also generate a Dockerfile, which can be used to build a 
+                       Docker image with such an R environment. Finally, copy all given files and directories
+                       in the output directory, together with the bootstrap scripts. This way, the output
+                       directory is a self-contained replication package for the data analysis.
+                       
+                       Directory structure of the output (relative to the directory where {script_name} is invoked):
+                       
+                          DIRECTORY                  CONTENT
+                          ./<outdir>/{scripts_dir}/        bootstrap scripts and Dockerfile
+                          ./<outdir>/<content>/      copy of list of files and directories given as input
+                          
+                       Use arguments --outdir and --content to set the values of <outdir> and <content>.
+                       
+                       The generated bootstrap scripts always install Stan for R. To change the structure of 
+                       the bootstrap scripts, edit the template files {dockerfile.fname}, {bash_bootstrap.fname},
+                       and {r_bootstrap.fname} in this script's directory {script_dir}."
+                       ))
+arguments <- parse_args(parser, positional_arguments=c(1, Inf))
+opt <- arguments$options
+infnames <- arguments$args
+out_path <- path.join(work_dir, opt$outdir)
+
+for (fname in infnames) {
+  if (file.access(fname) == -1)
+    stop(sprintf("Path '%s' does not exist", fname))
+}
+
+# Check if output directory exists
+if (file.exists(out_path)) {
+  if (opt$overwrite) {
+    warning(str_glue("Output directory {out_path} exists. Overwriting!"))
+    unlink(out_path, recursive=TRUE)
+  } else {
+    stop(str_glue("Output directory {out_path} exists! Delete it and try again."))
+  }
+}
+
+
+## Auxiliary functions
+
+# Returns the source code of object `code` as a string.
+code_as_str <- function(code)
+{
+  str_flatten(deparse(code), collapse="\n")
+}
+
+# Call remotes::install_version; if it raises any error, 
+# call it again after removing version number from the call's arguments.
+# This is useful in case some exact version numbers are no longer available.
+robust_install_version <- function(...)
+{
+  # Try to call remotes::install_version normally
+  tryCatch(remotes::install_version(...),
+           error=function(e) {
+             # If there's an error:
+             kwargs <- list(...)
+             # Remove the version number from the arguments
+             no.version <- kwargs[names(kwargs) != "version"]
+             # Call remotes::install_version again with the new arguments
+             do.call(remotes::install_version, no.version)
+           })
+}
+
+
+## Check if all the packages `requirements` are installed. Stop with
+## an error if any are not. The check ignores package versions.
+check_installed_packages <- function(requirements)
+{
+    session <- devtools::session_info(pkgs="installed")
+    installed <- data.frame(package=session$packages$package, version=session$packages$ondiskversion)
+    not_installed <- setdiff(requirements$package, installed$package)
+    if (length(not_installed) > 0)
+      stop(paste("The following required packages couldn't be installed:", 
+                 paste0(not_installed, collapse=" ")))
+}
+
+# Read template file `path`, and replace every occurrence of the pattern
+# '##[<VAR> var_name]##' with a format string token "{var_name}" (including 
+# quotation marks), and of the pattern '##[<VARU> var_name]##' with the same 
+# format string token without quotations.
+#
+# The result is a list of lines with these replacement, which can be merged
+# with str_flatten and then formatted with str_glue, passing a value for 
+# var_name as keyword arguments to str_glue.
+read_template <- function (path) 
+{
+  lines <- readLines(path)
+  newlines <- lapply(lines, function(line) {
+    mo <- str_match(line, "^(.*)##\\[<VAR(U?)>\\s*(\\w+)\\s*\\]##(.*)$")
+    if (!is.na(mo[4])) {
+      if (mo[3] == "U")
+        newline <- str_c(mo[2], '{', mo[4], '}', mo[5])
+      else
+        newline <- str_c(mo[2], '"{', mo[4], '}"', mo[5])
+    } else
+      newline <- line
+    newline
+  })
+  newlines
+}
+
+# Given a list of strings `template`, look for any occurrence of the pattern
+# '##[<INSTALL> regex_pattern ]##'. Then, select all elements of list `commands` 
+# whose _names_ match `regex_pattern`, and replace the <INSTALL> pattern with them.
+#
+# If the pattern is '##[<INSTALL> regex_pattern ][list_of_urls]##', also adds the
+# comma-separated list of URLs to in front of the repositories to install the package from.
+# This uses holes `{other_options}`  in the `commands` strings.
+#
+# The result is a list of lines, which can be used just like the result of `read_template`.
+add_commands <- function (template, commands)
+{
+  batches <- 0
+  added_cmds <- 0
+  newlines <- lapply(template, function(line) {
+    mo <- str_match(line, "^(.*)##\\[<INSTALL>\\s*([^\\s]+)\\s+(\\]\\[([^\\]]+))?\\]##(.*)$")
+    if (!is.na(mo[3])) {
+      batches <<- batches + 1
+      pat <- mo[3]
+      cmds <- commands[str_detect(names(commands), pat)]
+      if (is.na(mo[5]))
+        other_options <- ""
+      else {
+        repos <- str_split(mo[5], pattern=",\\s*")
+        other_options <- str_c(", repos=c('", str_flatten(repos, "', '"), "', getOption('repos'))")
+      }
+      cmds <- lapply(cmds, function(m) str_glue(m, other_options=other_options))
+      added_cmds <<- added_cmds + length(cmds)
+      newline <- str_flatten(cmds, collapse="\n")
+    } else {
+      newline <- line
+    }
+    newline
+  })
+  if (added_cmds == 0)
+    warning(str_glue("No installation commands found. Did you add a space after the regex in <INSTALL> pattern?"))
+  else
+    message(str_glue("Added {added_cmds} install commands in {batches} batches"))
+  newlines
+}
+
+
+## Collect information
+
+# Collect all used libraries
+requirements <- renv::dependencies(infnames)
+# Add Stan packages and others that are always added
+stan_pkgs <- c("rstan", "cmdstanr", "tinytex")
+requirements <- bind_rows(requirements, data.frame(Package=stan_pkgs, Dev=FALSE))
+# Remove duplicates (keep first row in every group)
+requirements <- requirements %>% group_by(Package, Version, Dev)  %>% slice_head()
+
+# Dev dependencies not supported
+requirements_dev <- requirements %>% filter(Dev)
+requirements <- requirements %>% filter(!Dev)
+by(requirements_dev, seq_len(nrow(requirements_dev)), 
+   function(row) warning(sprintf("Skipping development dependency '%s'", row$Package)))
+
+# Collect packages installed in this R installation
+session <- devtools::session_info(pkgs="installed")
+
+# Match requirements to package versions
+requirements_versions <- requirements %>% inner_join(session$packages, by=c("Package"="package"))
+all_requirements <- requirements %>% left_join(session$packages, by=c("Package"="package"))
+not_in_req <- setdiff(all_requirements$Package, requirements_versions$Package)
+base_packages <- rownames(installed.packages(priority="base"))
+not_in_req_base <- intersect(not_in_req, base_packages)
+not_in_req_nonbase <- setdiff(not_in_req, base_packages)
+if (length(not_in_req_nonbase) > 0)
+  warning(str_glue("The following dependencies won't be installed (not found on system): {str_c(not_in_req_nonbase, collapse=' ')}"))
+if (length(not_in_req_base) > 0)
+  message(str_glue("Ignoring {length(not_in_req_base)} dependencies in the base package ({str_c(not_in_req_base, collapse=' ')})."))
+
+
+r_install_cmds <- mapply(
+  function(p, v, s) { 
+    github_url <- str_match(s, "^Github\\s*\\(([^\\)]+)\\)")[2]
+    if (is.null(github_url) | is.na(github_url)) {
+      # Regular install
+      if ((is.null(v) | is.na(v)))
+        # Version unknown
+        command <- "robust_install_version('{p}'{{other_options}})"
+      else
+        # Specific version
+        command <- "robust_install_version('{p}', version='{v}'{{other_options}})"
+      res <- str_glue(command, p=p, v=v)
+    }
+    else
+      # Install from Github: version number not needed
+      command <- "remotes::install_github('{github_url}'{{other_options}}) # package {p}"
+    res <- str_glue(command, github_url=github_url, p=p, v=v)
+    ## Hole {other_option} to add other options to command
+    res
+  },
+  requirements_versions$Package, requirements_versions$ondiskversion, requirements_versions$source)
+
+r_version <- str_match(session$platform$version, "[rR]\\s+version\\s*(\\d+[.]\\d+([.]\\d+)?)")[2]
+
+conda_version <- tryCatch(
+  system("conda --version", intern=TRUE),
+  error=function(e){
+    warning(sprintf("Could not determine Conda version"))
+    return(NA)
+  })
+conda_version <- str_match(conda_version, "[cC][oO][nN][dD][aA]\\s+(\\d+[.]\\d+([.]\\d+)?)")[2]
+
+# Time zone
+time_zone <- Sys.timezone()
+
+
+## Generate scripts
+
+# Dockerfile
+dockerfile <- read_template(path.join(script_dir, dockerfile.fname))
+dockerfile <- str_glue(str_flatten(dockerfile, collapse="\n"),
+                       time_zone=time_zone, content_dir=opt$content, scripts_dir=scripts_dir)
+
+# Bash bootstrap
+bash_bootstrap <- read_template(path.join(script_dir, bash_bootstrap.fname))
+bash_bootstrap <- str_glue(str_flatten(bash_bootstrap, collapse="\n"), r_version=r_version)
+
+# R bootstrap
+r_bootstrap <- read_template(path.join(script_dir, r_bootstrap.fname))
+r_bootstrap <- add_commands(r_bootstrap, r_install_cmds)
+r_bootstrap <- str_glue(str_flatten(r_bootstrap, collapse="\n"), 
+                        cran=opt$cran, 
+                        robust_install_version_def=code_as_str(robust_install_version),
+                        check_installed_packages_def=code_as_str(check_installed_packages),
+                        requirements=code_as_str(data.frame(package=requirements_versions$Package,
+                                                            version=requirements_versions$ondiskversion)))
+
+## Generate output
+dir.create(out_path)
+
+# Add subdirectory for scripts, and write out scripts there
+scripts_path <- path.join(out_path, scripts_dir)
+dir.create(scripts_path)
+writeLines(dockerfile, con=path.join(scripts_path, dockerfile.fname))
+writeLines(bash_bootstrap, con=path.join(scripts_path, bash_bootstrap.fname))
+writeLines(r_bootstrap, con=path.join(scripts_path, r_bootstrap.fname))
+
+# Add subdirectory with analysis data and scripts, and copy `infnames` there
+content_path <- path.join(out_path, opt$content)
+dir.create(content_path)
+# Assignment so that file.copy doesn't print anything
+fc_ <- file.copy(infnames, content_path, overwrite=TRUE, recursive=TRUE)
+
+
+# Generate top-level README.md file, with reference
+readme.fname <- "README.md"
+readme_content <- c(str_glue("# {opt$outdir}"), "", "", "Replication package generated with [R-arrr](https://github.com/bugcounting/rarrr).")
+writeLines(readme_content, con=path.join(out_path, readme.fname))
+
+message(str_glue("Done! Find the replication package at {out_path}"))

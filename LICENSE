@@ -1,0 +1,11 @@
+This repository contains the source code of `arrr`: an R script to
+help generate replication packages that run statistical analyses in R.
+
+Copyright (C) 2023 Carlo A. Furia
+
+This program is free software: you can redistribute 
+it and/or modify it under the terms of the GNU 
+General Public License as published by the Free 
+Software Foundation, either version 3 of the License, 
+or (at your option) any later version. To view a copy 
+of this license, visit https://www.gnu.org/licenses/gpl-3.0.html.
